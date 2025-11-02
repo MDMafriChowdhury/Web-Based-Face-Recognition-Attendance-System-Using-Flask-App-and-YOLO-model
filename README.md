@@ -49,7 +49,7 @@ python app.py
 ```
 After starting, the terminal will show a message similar to:
 ```pgsql
-[INFO] To access from your phone, use https://192.168.1.10:5000
+[INFO] To access from your phone, use https://<ip>:5000
 ```
 # Access the Application
 
