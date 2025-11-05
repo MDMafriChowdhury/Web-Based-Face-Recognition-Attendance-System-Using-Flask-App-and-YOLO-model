@@ -62,7 +62,7 @@ https://<ip>:5000
 - Accept the browser's security warning by clicking:
 Advanced → Proceed to [your IP address] (unsafe)
 
-# Train a New User
+# Train a New User(RealTime training)
 ```text
 1. Click "Train New User" on the main page.
 2. Enter the user’s name and click "Start Training".
