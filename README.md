@@ -91,6 +91,16 @@ Smart attendance logic ensures:
 - A user cannot check in twice.
 - A user cannot check out without checking in.
 
+# View Reports:
+
+- Go to the reports page: https://<YOUR_PC_IP>:5000/reports
+
+- Use the filters to select a user or date range.
+
+- Click "Fetch Report" to see the data on the page.
+
+- Click "Download PDF" to save the same report as a PDF.
+
 # Technologies Used
 
 Flask – Web framework for backend logic
