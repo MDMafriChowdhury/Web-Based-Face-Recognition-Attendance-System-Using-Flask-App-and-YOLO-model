@@ -9,16 +9,30 @@ import base64
 import io
 from PIL import Image
 from fpdf import FPDF
+import odoorpc 
+import datetime # Make sure datetime is imported
+
+# --- Odoo Configuration ---
+# !! THIS IS UPDATED WITH YOUR ODOO.COM DETAILS !!
+ODOO_URL = 'Your Odoo.com URL'  # Your Odoo.com URL
+ODOO_DB = 'Your Database Name'                   # Your Database Name
+ODOO_USER = 'Your Odoo user email'      # Your Odoo user email
+
+# --- IMPORTANT ---
+# PASTE YOUR NEW ODOO API KEY HERE. Your regular password will not work
+# because you have 2-Factor Authentication enabled.
+ODOO_PASSWORD = 'API KEY '           
 
 # --- Configuration ---
 HAAR_CASCADE_PATH = 'haarcascade_frontalface_default.xml'
 TRAINER_FILE = 'trainer.yml'
-DATABASE_FILE = 'attendance.db'
-DATASET_PATH = 'dataset' # Added for training
+DATABASE_FILE = 'attendance.db' # Still used for user name mapping
+DATASET_PATH = 'dataset'
 CONFIDENCE_THRESHOLD = 50 
 
 # --- Initialize Flask App ---
-app = Flask(__name__)
+# NOTE: We specify the 'templates' folder for HTML files
+app = Flask(__name__, template_folder='templates')
 
 # --- Helper: Create dataset directory ---
 if not os.path.exists(DATASET_PATH):
@@ -34,7 +48,8 @@ app.last_action_time = 0
 COOLDOWN_SECONDS = 5
 user_map = {} # Will be loaded at startup
 
-# --- Database Helper Functions (Moved from train_tool.py) ---
+# --- Database Helper Functions (Still used for training) ---
+# (Your original init_db, load_user_map_from_db, etc. remain unchanged)
 
 def init_db():
     """Initializes the database and creates tables if they don't exist."""
@@ -120,56 +135,104 @@ def create_user_in_db(user_id, name):
         conn.close()
     return True
 
-def record_attendance_db(user_id, user_name, event_type):
-    """Records a check-in or check-out event to the database."""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    now = datetime.datetime.now()
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    time_str = now.strftime("%H:%M:%S")
+# --- NEW: Odoo Attendance Function ---
+def record_attendance_odoo(user_name):
+    """
+    Connects to Odoo and triggers an attendance action for the employee.
+    The employee name in Odoo MUST match the 'user_name' perfectly.
     
+    *** NEW LOGIC ***
+    This function now replicates the logic from Odoo's private
+    '_attendance_action_change' method to be version-independent.
+    """
     try:
-        cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if not row:
-            return (f"Error: User ID {user_id} not found.", False)
-            
-        current_status = row[0]
-        is_success = False
-        
-        if event_type == "check-in":
-            if current_status == "checked-in":
-                message = f"'{user_name}' is already checked in."
-            else:
-                cursor.execute("UPDATE users SET status = 'checked-in' WHERE user_id = ?", (user_id,))
-                message = f"'{user_name}' checked-in at {time_str}"
-                is_success = True
-                
-        elif event_type == "check-out":
-            if current_status == "checked-out":
-                message = f"'{user_name}' must check in first."
-            else:
-                cursor.execute("UPDATE users SET status = 'checked-out' WHERE user_id = ?", (user_id,))
-                message = f"'{user_name}' checked-out at {time_str}"
-                is_success = True
-        
-        if is_success:
-            cursor.execute(
-                "INSERT INTO events (user_id, event_type, timestamp) VALUES (?, ?, ?)",
-                (user_id, event_type, timestamp_str)
-            )
-            conn.commit()
-            print(f"[Attendance] {message}")
-        
-        return (message, is_success)
-        
-    except sqlite3.Error as e:
-        conn.rollback()
-        print(f"Error recording attendance: {e}")
-        return ("Database Error", False)
-    finally:
-        conn.close()
+        print(f"[Odoo] Attempting to connect to {ODOO_URL}...")
 
+        # *** THIS IS UPDATED FOR ODOO.COM ***
+        # We connect to your Odoo.com host using the 'jsonrpc+ssl' protocol on port 443
+        odoo = odoorpc.ODOO(
+            ODOO_URL.replace('https://', ''), 
+            protocol='jsonrpc+ssl', 
+            port=443
+        )
+        odoo.login(ODOO_DB, ODOO_USER, ODOO_PASSWORD)
+
+        print(f"[Odoo] Connection successful.")
+
+        # 1. Find the Odoo Employee
+        Employee = odoo.env['hr.employee']
+        employee_ids = Employee.search([('name', '=', user_name)])
+        
+        if not employee_ids:
+            msg = f"Odoo Error: Employee '{user_name}' not found."
+            print(f"[Odoo] {msg}")
+            return (msg, False)
+            
+        employee_id = employee_ids[0]
+        # Get a "browsable" record to read its fields
+        employee = Employee.browse(employee_id)
+        
+        print(f"[Odoo] Found employee: {employee.name} (ID: {employee.id})")
+
+        # 2. Read the employee's current attendance state
+        # This field ('attendance_state') is confirmed from your hr_employee.py file
+        current_state = employee.attendance_state
+        print(f"[Odoo] Employee current state: {current_state}")
+
+        Attendance = odoo.env['hr.attendance']
+        action_date = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 3. Perform the correct action based on the state
+        if current_state == 'checked_out':
+            # ACTION: Check In
+            # We create a new attendance record
+            print(f"[Odoo] Action: Checking IN")
+            vals = {
+                'employee_id': employee_id,
+                'check_in': action_date,
+            }
+            new_att_id = Attendance.create(vals)
+            print(f"[Odoo] Created new attendance record (ID: {new_att_id})")
+            message = f"'{user_name}' checked in successfully in Odoo."
+            return (message, True)
+
+        elif current_state == 'checked_in':
+            # ACTION: Check Out
+            # We find the last "open" attendance record and close it
+            print(f"[Odoo] Action: Checking OUT")
+            
+            # Find attendance record for this employee that has no check_out
+            domain = [
+                ('employee_id', '=', employee_id),
+                ('check_out', '=', False)
+            ]
+            attendance_ids = Attendance.search(domain, limit=1)
+            
+            if not attendance_ids:
+                msg = f"Odoo Error: Cannot check out. No open check-in record found for '{user_name}'."
+                print(f"[Odoo] {msg}")
+                return (msg, False)
+
+            # Get the one record to update
+            attendance_to_close = Attendance.browse(attendance_ids[0])
+            attendance_to_close.write({'check_out': action_date})
+            
+            print(f"[Odoo] Closed attendance record (ID: {attendance_ids[0]})")
+            message = f"'{user_name}' checked out successfully in Odoo."
+            return (message, True)
+
+        else:
+            msg = f"Odoo Error: Unknown attendance state '{current_state}'."
+            print(f"[Odoo] {msg}")
+            return (msg, False)
+
+    except Exception as e:
+        msg = f"Odoo API Error: {str(e)}"
+        print(f"[Odoo] {msg}")
+        return (msg, False)
+
+
+# --- Image Decoding Function (Unchanged) ---
 def decode_base64_image(base64_string):
     """Decodes a base64 string into a CV2-compatible image."""
     try:
@@ -183,7 +246,7 @@ def decode_base64_image(base64_string):
         print(f"Error decoding base64 image: {e}")
         return None
 
-# --- Training Helper (from train_tool.py) ---
+# --- Training Helper (Unchanged) ---
 def get_images_and_labels(path):
     image_paths = [os.path.join(path, f) for f in os.listdir(path)]
     face_samples = []
@@ -209,7 +272,7 @@ def get_images_and_labels(path):
             
     return face_samples, ids
 
-# --- Helper to load recognizer ---
+# --- Helper to load recognizer (Unchanged) ---
 def load_recognizer():
     global recognizer, user_map
     if not os.path.exists(TRAINER_FILE):
@@ -222,19 +285,17 @@ def load_recognizer():
     except cv2.error as e:
         print(f"Error loading recognizer: {e}. Is trainer.yml valid?")
 
-# --- NEW HELPER: Format Duration ---
+# --- Format Duration Helper (Unchanged) ---
 def format_duration(seconds):
-    """Converts seconds into a human-readable Hh Mm Ss format."""
+    # (Your original function)
     if seconds is None or seconds < 0:
         return "N/A"
     if seconds == 0:
         return "0m 0s"
-        
     hours = int(seconds // 3600)
     seconds %= 3600
     minutes = int(seconds // 60)
     seconds = int(seconds % 60)
-    
     parts = []
     if hours > 0:
         parts.append(f"{hours}h")
@@ -242,8 +303,8 @@ def format_duration(seconds):
         parts.append(f"{minutes}m")
     if seconds > 0 or not parts:
         parts.append(f"{seconds}s")
-        
     return " ".join(parts)
+
 
 # --- Flask API Routes ---
 
@@ -255,6 +316,7 @@ def index():
 @app.route('/recognize_frame', methods=['POST'])
 def recognize_frame():
     """Receives a frame from the client, recognizes it, and returns the user info."""
+    # (This function is unchanged)
     data = request.json
     if not data or 'image' not in data:
         return jsonify({"status": "error", "message": "No image data provided"}), 400
@@ -283,25 +345,41 @@ def recognize_frame():
     else:
         return jsonify({"status": "unknown", "confidence": round(100 - confidence)})
 
+# --- MODIFIED Attendance Route ---
 @app.route('/attendance_action', methods=['POST'])
 def attendance_action():
-    """Handles check-in and check-out button presses."""
+    """
+    Handles check-in and check-out button presses.
+    MODIFIED: This now calls the Odoo API function.
+    """
     now = time.time()
     if now - app.last_action_time < COOLDOWN_SECONDS:
         return jsonify({"success": False, "message": "Please wait..."})
     
     data = request.json
-    if data.get('user_id') is None:
+    if data.get('user_id') is None or data.get('user_name') is None:
         return jsonify({"success": False, "message": "No known face detected!"})
 
-    message, is_success = record_attendance_db(data['user_id'], data['user_name'], data['action'])
+    # --- THIS IS THE CHANGE ---
+    user_name = data.get('user_name') # Get the name from the request
+    
+    # OLD WAY:
+    # message, is_success = record_attendance_db(data['user_id'], data['user_name'], data['action']) 
+    
+    # NEW WAY:
+    # We pass the 'user_name'. Odoo handles the 'action' (in/out) logic.
+    message, is_success = record_attendance_odoo(user_name)
+    # --- END OF CHANGE ---
+
     if is_success:
         app.last_action_time = now
     
     return jsonify({"success": is_success, "message": message})
 
 
-# --- NEW TRAINING ROUTES ---
+# --- NEW TRAINING ROUTES (Unchanged) ---
+# (Your original /train, /start_training, /capture_frame, 
+# and /run_model_training routes remain unchanged)
 
 @app.route('/train')
 def train_page():
@@ -385,7 +463,8 @@ def run_model_training():
         print(f"Error during training: {e}")
         return jsonify({"success": False, "message": f"Error during training: {e}"})
 
-# --- PDF Helper Class (MODIFIED) ---
+# --- PDF Helper Class (Unchanged) ---
+# (Your original PDF class)
 class PDF(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 12)
@@ -399,73 +478,53 @@ class PDF(FPDF):
     
     def report_table(self, data, col_widths):
         self.set_font('Arial', 'B', 10)
-        
-        # Headers (MODIFIED)
         headers = ['Name', 'Date', 'First In', 'Last Out', 'Total Duration', 'All Sessions']
         col_keys = ['name', 'date', 'first_in', 'last_out', 'duration', 'sessions']
-        
         for i, header in enumerate(headers):
             self.cell(col_widths[col_keys[i]], 10, header, 1, 0, 'C')
         self.ln()
-        
-        # Data (MODIFIED - Using MultiCell for robust row height)
         self.set_font('Arial', '', 9)
         if not data:
             self.cell(sum(col_widths.values()), 10, 'No data found for this selection.', 1, 1, 'C')
             return
-            
         for row in data:
             start_y = self.get_y()
-            
-            # Create a list of all data points for the row
             row_data_points = [
                 str(row['name']),
                 str(row['event_date']),
                 str(row['first_check_in']),
                 str(row['last_check_out']),
                 str(row['total_duration_formatted']),
-                str(row['all_sessions']) # The new multi-line data
+                str(row['all_sessions'])
             ]
-            
-            max_y = start_y
-            
-            # Draw all cells as MultiCells to handle wrapping and get max height
             cell_heights = []
-            
-            # First pass: Draw MultiCells and find max height
             current_x = self.get_x()
             for i, key in enumerate(col_keys):
                 width = col_widths[key]
                 self.multi_cell(width, 8, row_data_points[i], 0, 'L')
                 cell_heights.append(self.get_y())
                 current_x += width
-                self.set_xy(current_x, start_y) # Reset Y for next cell
-            
+                self.set_xy(current_x, start_y)
             max_y = max(cell_heights)
-            
-            # Second pass: Draw the borders based on max_y
             current_x = self.l_margin
-            self.set_xy(current_x, start_y) # Go back to start of row
+            self.set_xy(current_x, start_y)
             for i, key in enumerate(col_keys):
                 width = col_widths[key]
-                # Draw border for the full height of the row
                 self.rect(current_x, start_y, width, max_y - start_y)
                 current_x += width
-            
-            self.set_xy(self.l_margin, max_y) # Move to the next line
+            self.set_xy(self.l_margin, max_y)
 
-# --- Internal Helper for fetching report data (MODIFIED) ---
-
+# --- Internal Report Data Helper (Unchanged) ---
+# (Your original _get_report_data function)
+# This will now only report on the local DB, which is no longer used
+# for attendance. All new reports should be viewed inside Odoo.
 def _get_report_data(user_id, start_date, end_date):
     """Internal function to query the DB for a smart summary report."""
     conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row # This lets us access columns by name
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    
     params = []
     conditions = []
-    
-    # Build WHERE conditions for the CTE
     if user_id:
         conditions.append("e.user_id = ?")
         params.append(user_id)
@@ -475,99 +534,49 @@ def _get_report_data(user_id, start_date, end_date):
     if end_date:
         conditions.append("DATE(e.timestamp) <= ?")
         params.append(end_date)
-    
     where_clause = " AND ".join(conditions) if conditions else "1=1"
-
-    # This is the new "smart" query to calculate daily summaries
     query = f"""
     WITH PairedEvents AS (
         SELECT
-            e.user_id,
-            e.event_type,
-            e.timestamp,
-            DATE(e.timestamp) AS event_date,
-            TIME(e.timestamp) AS event_time,
-            LEAD(e.event_type, 1) OVER (
-                PARTITION BY e.user_id, DATE(e.timestamp) 
-                ORDER BY e.timestamp
-            ) AS next_event_type,
-            LEAD(e.timestamp, 1) OVER (
-                PARTITION BY e.user_id, DATE(e.timestamp) 
-                ORDER BY e.timestamp
-            ) AS next_timestamp
+            e.user_id, e.event_type, e.timestamp,
+            DATE(e.timestamp) AS event_date, TIME(e.timestamp) AS event_time,
+            LEAD(e.event_type, 1) OVER (PARTITION BY e.user_id, DATE(e.timestamp) ORDER BY e.timestamp) AS next_event_type,
+            LEAD(e.timestamp, 1) OVER (PARTITION BY e.user_id, DATE(e.timestamp) ORDER BY e.timestamp) AS next_timestamp
         FROM events e
         WHERE {where_clause}
     ),
-    
     Calculations AS (
         SELECT
-            user_id,
-            event_date,
-            
-            -- Calculate duration for valid pairs
-            CASE
-                WHEN event_type = 'check-in' AND next_event_type = 'check-out'
-                THEN (strftime('%s', next_timestamp) - strftime('%s', timestamp))
-                ELSE 0
-            END AS duration_seconds,
-            
-            -- Create a string for each valid session
-            CASE
-                WHEN event_type = 'check-in' AND next_event_type = 'check-out'
-                THEN TIME(timestamp) || ' - ' || TIME(next_timestamp)
-                ELSE NULL
-            END AS session_string,
-            
-            -- Flag for first check-in
-            CASE
-                WHEN event_type = 'check-in'
-                THEN event_time
-                ELSE NULL
-            END AS check_in_time,
-            
-            -- Flag for last check-out
-            CASE
-                WHEN event_type = 'check-out'
-                THEN event_time
-                ELSE NULL
-            END AS check_out_time
-            
+            user_id, event_date,
+            CASE WHEN event_type = 'check-in' AND next_event_type = 'check-out' THEN (strftime('%s', next_timestamp) - strftime('%s', timestamp)) ELSE 0 END AS duration_seconds,
+            CASE WHEN event_type = 'check-in' AND next_event_type = 'check-out' THEN TIME(timestamp) || ' - ' || TIME(next_timestamp) ELSE NULL END AS session_string,
+            CASE WHEN event_type = 'check-in' THEN event_time ELSE NULL END AS check_in_time,
+            CASE WHEN event_type = 'check-out' THEN event_time ELSE NULL END AS check_out_time
         FROM PairedEvents
     )
-    
     SELECT
-        u.name,
-        c.event_date,
+        u.name, c.event_date,
         MIN(c.check_in_time) AS first_check_in,
         MAX(c.check_out_time) AS last_check_out,
         SUM(c.duration_seconds) AS total_duration_seconds,
-        -- Use GROUP_CONCAT to combine all session strings, separated by a newline
-        -- MODIFIED: Replaced FILTER clause with a CASE statement for wider SQLite compatibility
         GROUP_CONCAT(CASE WHEN c.session_string IS NOT NULL THEN c.session_string ELSE NULL END, CHAR(10)) AS all_sessions
     FROM Calculations c
     JOIN users u ON u.user_id = c.user_id
     GROUP BY u.name, c.event_date
-    HAVING first_check_in IS NOT NULL -- Only show days where user was present
+    HAVING first_check_in IS NOT NULL
     ORDER BY c.event_date DESC, u.name;
     """
-
     try:
         cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
-        # Convert rows to dicts and format the duration
         report_data = []
         for row in rows:
             row_dict = dict(row)
             row_dict['total_duration_formatted'] = format_duration(row_dict.get('total_duration_seconds'))
-            # Handle NULLs from DB
-            if not row_dict['first_check_in']:
-                row_dict['first_check_in'] = "---"
-            if not row_dict['last_check_out']:
-                row_dict['last_check_out'] = "---"
-            if not row_dict['all_sessions']:
-                row_dict['all_sessions'] = "No sessions"
+            if not row_dict['first_check_in']: row_dict['first_check_in'] = "---"
+            if not row_dict['last_check_out']: row_dict['last_check_out'] = "---"
+            if not row_dict['all_sessions']: row_dict['all_sessions'] = "No sessions"
             report_data.append(row_dict)
-            
         return report_data, None
     except sqlite3.Error as e:
         print(f"Error fetching smart report: {e}")
@@ -576,8 +585,8 @@ def _get_report_data(user_id, start_date, end_date):
         conn.close()
 
 
-# --- NEW REPORTING & ADMIN ROUTES ---
-
+# --- REPORTING & ADMIN ROUTES (Unchanged) ---
+# (These routes remain unchanged, but will only report on the local DB)
 @app.route('/reports')
 def reports_page():
     """Serves the new reports/admin page."""
@@ -591,7 +600,6 @@ def get_all_users():
     try:
         cursor.execute("SELECT user_id, name FROM users ORDER BY name")
         users = cursor.fetchall()
-        # Convert list of tuples to list of dicts for easier JSON
         user_list = [{"user_id": row[0], "name": row[1]} for row in users]
         return jsonify(user_list)
     except sqlite3.Error as e:
@@ -606,9 +614,7 @@ def get_attendance_report_json():
     user_id = request.args.get('user_id')
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
-    
     data, error = _get_report_data(user_id, start_date, end_date)
-    
     if error:
         return jsonify({"error": error}), 500
     return jsonify(data)
@@ -619,34 +625,15 @@ def download_pdf_report():
     user_id = request.args.get('user_id')
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
-
     data, error = _get_report_data(user_id, start_date, end_date)
-    
     if error:
         return f"Error generating report: {error}", 500
-    
-    # --- FIX: Instantiate the PDF object ---
-    # MODIFIED: Set orientation and format in the constructor, not add_page()
     pdf = PDF(orientation='L', format='A4')
-    pdf.add_page() # Use Landscape mode for more space
-    
-    # Define column widths (MODIFIED)
-    col_widths = {
-        'name': 45,
-        'date': 25,
-        'first_in': 25,
-        'last_out': 25,
-        'duration': 30,
-        'sessions': 127 # Total 277, fits A4-L page
-    }
-    
+    pdf.add_page()
+    col_widths = {'name': 45, 'date': 25, 'first_in': 25, 'last_out': 25, 'duration': 30, 'sessions': 127}
     pdf.report_table(data, col_widths)
-
-    # Generate a dynamic filename
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"attendance_report_{timestamp}.pdf"
-    
-    # Create a response and send the PDF data
     response = make_response(pdf.output(dest='S').encode('latin-1'))
     response.headers['Content-Type'] = 'application/pdf'
     response.headers['Content-Disposition'] = f'attachment; filename={filename}'
@@ -655,9 +642,13 @@ def download_pdf_report():
 
 # --- Main ---
 if __name__ == "__main__":
-    init_db() # Ensure DB exists
+    init_db() # Ensure local DB exists for training
     load_recognizer() # Load models on startup
     
     print("[INFO] Starting Flask server...")
-    print("[INFO] To access from your phone, use https://<YOUR_PC_IP_ADDRESS>:5000")
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=False, ssl_context='adhoc')
+    print("[INFO] To access from Odoo/phone, use https://<YOUR_PC_IP_ADDRESS>:5000")
+    
+    # Use adhoc SSL context for HTTPS, which is required for
+    # cameras in modern browsers and for embedding in an HTTPS Odoo.
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, 
+            use_reloader=False, ssl_context='adhoc')
