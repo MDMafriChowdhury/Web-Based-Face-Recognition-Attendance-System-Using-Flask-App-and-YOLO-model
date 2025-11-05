@@ -15,13 +15,12 @@ import datetime # Make sure datetime is imported
 # --- Odoo Configuration ---
 # !! THIS IS UPDATED WITH YOUR ODOO.COM DETAILS !!
 ODOO_URL = 'Your Odoo.com URL'  # Your Odoo.com URL
-ODOO_DB = 'Your Database Name'                   # Your Database Name
+ODOO_DB = 'Your Database Name'     # Your Database Name
 ODOO_USER = 'Your Odoo user email'      # Your Odoo user email
-
 # --- IMPORTANT ---
 # PASTE YOUR NEW ODOO API KEY HERE. Your regular password will not work
 # because you have 2-Factor Authentication enabled.
-ODOO_PASSWORD = 'API KEY '           
+ODOO_PASSWORD = 'API KEY'           
 
 # --- Configuration ---
 HAAR_CASCADE_PATH = 'haarcascade_frontalface_default.xml'
@@ -519,70 +518,108 @@ class PDF(FPDF):
 # This will now only report on the local DB, which is no longer used
 # for attendance. All new reports should be viewed inside Odoo.
 def _get_report_data(user_id, start_date, end_date):
-    """Internal function to query the DB for a smart summary report."""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    params = []
-    conditions = []
-    if user_id:
-        conditions.append("e.user_id = ?")
-        params.append(user_id)
-    if start_date:
-        conditions.append("DATE(e.timestamp) >= ?")
-        params.append(start_date)
-    if end_date:
-        conditions.append("DATE(e.timestamp) <= ?")
-        params.append(end_date)
-    where_clause = " AND ".join(conditions) if conditions else "1=1"
-    query = f"""
-    WITH PairedEvents AS (
-        SELECT
-            e.user_id, e.event_type, e.timestamp,
-            DATE(e.timestamp) AS event_date, TIME(e.timestamp) AS event_time,
-            LEAD(e.event_type, 1) OVER (PARTITION BY e.user_id, DATE(e.timestamp) ORDER BY e.timestamp) AS next_event_type,
-            LEAD(e.timestamp, 1) OVER (PARTITION BY e.user_id, DATE(e.timestamp) ORDER BY e.timestamp) AS next_timestamp
-        FROM events e
-        WHERE {where_clause}
-    ),
-    Calculations AS (
-        SELECT
-            user_id, event_date,
-            CASE WHEN event_type = 'check-in' AND next_event_type = 'check-out' THEN (strftime('%s', next_timestamp) - strftime('%s', timestamp)) ELSE 0 END AS duration_seconds,
-            CASE WHEN event_type = 'check-in' AND next_event_type = 'check-out' THEN TIME(timestamp) || ' - ' || TIME(next_timestamp) ELSE NULL END AS session_string,
-            CASE WHEN event_type = 'check-in' THEN event_time ELSE NULL END AS check_in_time,
-            CASE WHEN event_type = 'check-out' THEN event_time ELSE NULL END AS check_out_time
-        FROM PairedEvents
-    )
-    SELECT
-        u.name, c.event_date,
-        MIN(c.check_in_time) AS first_check_in,
-        MAX(c.check_out_time) AS last_check_out,
-        SUM(c.duration_seconds) AS total_duration_seconds,
-        GROUP_CONCAT(CASE WHEN c.session_string IS NOT NULL THEN c.session_string ELSE NULL END, CHAR(10)) AS all_sessions
-    FROM Calculations c
-    JOIN users u ON u.user_id = c.user_id
-    GROUP BY u.name, c.event_date
-    HAVING first_check_in IS NOT NULL
-    ORDER BY c.event_date DESC, u.name;
+    """
+    Internal function to query ODOO for a smart summary report.
+    This replaces the old function that read from SQLite.
     """
     try:
-        cursor.execute(query, tuple(params))
-        rows = cursor.fetchall()
-        report_data = []
-        for row in rows:
-            row_dict = dict(row)
-            row_dict['total_duration_formatted'] = format_duration(row_dict.get('total_duration_seconds'))
-            if not row_dict['first_check_in']: row_dict['first_check_in'] = "---"
-            if not row_dict['last_check_out']: row_dict['last_check_out'] = "---"
-            if not row_dict['all_sessions']: row_dict['all_sessions'] = "No sessions"
-            report_data.append(row_dict)
-        return report_data, None
-    except sqlite3.Error as e:
-        print(f"Error fetching smart report: {e}")
-        return None, str(e)
-    finally:
-        conn.close()
+        print("[Odoo] Connecting for report...")
+        odoo = odoorpc.ODOO(
+            ODOO_URL.replace('https://', ''), 
+            protocol='jsonrpc+ssl', 
+            port=443
+        )
+        odoo.login(ODOO_DB, ODOO_USER, ODOO_PASSWORD)
+        print("[Odoo] Report connection successful.")
+        
+        Attendance = odoo.env['hr.attendance']
+        domain = []
+        
+        if user_id:
+            domain.append(('employee_id', '=', int(user_id)))
+        if start_date:
+            # Odoo's datetime fields are UTC.
+            domain.append(('check_in', '>=', f"{start_date} 00:00:00"))
+        if end_date:
+            domain.append(('check_in', '<=', f"{end_date} 23:59:59"))
+
+        # Fetch all relevant attendance records
+        # odoorpc < 0.8 returns datetimes as strings. >= 0.8 returns datetime objects
+        # Let's force string conversion for safety and parse manually.
+        attendances = Attendance.search_read(
+            domain,
+            fields=['employee_id', 'check_in', 'check_out', 'worked_hours'],
+            order='check_in asc'
+        )
+        
+        # Process data in Python
+        report_data = {} # Key: (employee_id, date_str)
+        
+        for att in attendances:
+            # att['employee_id'] is a list: [id, name]
+            employee_id = att['employee_id'][0]
+            employee_name = att['employee_id'][1]
+            
+            check_in_str = att['check_in']
+            if not check_in_str:
+                continue # Should not happen, but good to check
+            
+            # Parse naive datetime string from Odoo (which is in UTC)
+            check_in_dt = datetime.datetime.strptime(check_in_str, '%Y-%m-%d %H:%M:%S')
+            
+            event_date_str = check_in_dt.strftime('%Y-%m-%d')
+            key = (employee_id, event_date_str)
+
+            # Initialize dict for this employee on this day
+            if key not in report_data:
+                report_data[key] = {
+                    'name': employee_name,
+                    'event_date': event_date_str,
+                    'check_ins': [],
+                    'check_outs': [],
+                    'sessions': [],
+                    'total_duration_seconds': 0
+                }
+            
+            report_data[key]['check_ins'].append(check_in_dt)
+            
+            # Add duration. Odoo 'worked_hours' is in hours (float)
+            report_data[key]['total_duration_seconds'] += (att['worked_hours'] * 3600)
+            
+            check_out_str = att['check_out'] # This can be False or a string
+            
+            if check_out_str:
+                check_out_dt = datetime.datetime.strptime(check_out_str, '%Y-%m-%d %H:%M:%S')
+                report_data[key]['check_outs'].append(check_out_dt)
+                session_str = f"{check_in_dt.strftime('%H:%M:%S')} - {check_out_dt.strftime('%H:%M:%S')}"
+            else:
+                session_str = f"{check_in_dt.strftime('%H:%M:%S')} - (Still In)"
+            
+            report_data[key]['sessions'].append(session_str)
+
+        # Finalize the list for the report
+        final_list = []
+        for key, data in sorted(report_data.items(), key=lambda item: (item[1]['event_date'], item[1]['name']), reverse=True):
+            first_in = min(data['check_ins']).strftime('%H:%M:%S') if data['check_ins'] else "---"
+            last_out = max(data['check_outs']).strftime('%H:%M:%S') if data['check_outs'] else "---"
+            all_sessions = "\n".join(data['sessions']) if data['sessions'] else "No sessions"
+            
+            final_list.append({
+                'name': data['name'],
+                'event_date': data['event_date'],
+                'first_check_in': first_in,
+                'last_check_out': last_out,
+                'total_duration_seconds': data['total_duration_seconds'],
+                'total_duration_formatted': format_duration(data['total_duration_seconds']),
+                'all_sessions': all_sessions
+            })
+        
+        return final_list, None
+
+    except Exception as e:
+        msg = f"Odoo Report Error: {str(e)}"
+        print(f"[Odoo] {msg}")
+        return None, msg
 
 
 # --- REPORTING & ADMIN ROUTES (Unchanged) ---
@@ -594,19 +631,29 @@ def reports_page():
 
 @app.route('/api/users', methods=['GET'])
 def get_all_users():
-    """Fetches all users for the report filter dropdown."""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    """Fetches all users from ODOO for the report filter dropdown."""
     try:
-        cursor.execute("SELECT user_id, name FROM users ORDER BY name")
-        users = cursor.fetchall()
-        user_list = [{"user_id": row[0], "name": row[1]} for row in users]
+        print("[Odoo] Connecting for user list...")
+        odoo = odoorpc.ODOO(
+            ODOO_URL.replace('https://', ''), 
+            protocol='jsonrpc+ssl', 
+            port=443
+        )
+        odoo.login(ODOO_DB, ODOO_USER, ODOO_PASSWORD)
+        
+        Employee = odoo.env['hr.employee']
+        # Fetch all employees, just id and name, order by name
+        employees = Employee.search_read([], fields=['id', 'name'], order='name asc')
+        
+        # Format as the UI expects
+        user_list = [{"user_id": emp['id'], "name": emp['name']} for emp in employees]
+        print(f"[Odoo] Found {len(user_list)} employees.")
         return jsonify(user_list)
-    except sqlite3.Error as e:
-        print(f"Error fetching all users: {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
+        
+    except Exception as e:
+        msg = f"Odoo User Fetch Error: {str(e)}"
+        print(f"[Odoo] {msg}")
+        return jsonify({"error": msg}), 500
 
 @app.route('/api/attendance_report', methods=['GET'])
 def get_attendance_report_json():
