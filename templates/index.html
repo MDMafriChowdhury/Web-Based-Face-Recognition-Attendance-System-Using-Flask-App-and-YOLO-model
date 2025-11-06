@@ -10,52 +10,76 @@
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
-            min-height: 100vh;
+            justify-content: center; /* Vertically center all content */
+            
+            /* --- MODIFICATION FOR MOBILE --- */
+            height: 100vh; /* Fallback for browsers without JS */
+            /* Use the new CSS variable calculated by JS */
+            height: calc(var(--vh, 1vh) * 100); 
+            /* --- END MODIFICATION --- */
+            
+            overflow: hidden; /* Prevent mobile scroll bounce */
             background-color: #f0f2f5;
             margin: 0;
+            padding: 8px; /* Add padding around the edges */
+            box-sizing: border-box; /* Include padding in height calculation */
             color: #333;
         }
         h1 {
             color: #1c1e21;
             font-weight: 600;
             text-align: center;
+            font-size: 1.5rem; /* Smaller title */
+            margin: 8px 0; /* Reduced margin */
+            flex-shrink: 0; /* Don't shrink title */
         }
         #video-container {
             position: relative;
-            width: 90%;
+            width: 100%; /* Full width within body padding */
             max-width: 640px;
             border-radius: 12px;
             overflow: hidden;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
             background-color: #000;
+            max-height: 60vh; /* Constrain video height */
+            flex-shrink: 1; /* Allow video to shrink to fit */
+            flex-basis: 60%; /* Give it a flexible basis */
         }
         #video-feed {
             width: 100%;
             height: auto;
             display: block;
+            max-height: 60vh; /* Match container constraint */
             /* Flip the video if it's the front camera */
             transform: scaleX(-1);
         }
         #detection-status {
-            margin-top: 16px;
-            font-size: 1.2rem;
+            margin-top: 12px; /* Reduced margin */
+            font-size: 1.1rem; /* Smaller text */
             font-weight: 600;
-            height: 30px;
+            
+            /* --- MODIFICATION FOR WRAPPING --- */
+            min-height: 24px; /* Changed from height */
+            height: auto;     /* Allow it to grow if text wraps */
+            width: 90%;       /* Prevent it from being too wide */
+            /* --- END MODIFICATION --- */
+
             text-align: center;
             color: #1c1e21;
+            flex-shrink: 0; /* Don't shrink this text */
         }
         #controls {
             display: flex;
             flex-wrap: wrap; /* Allow buttons to wrap on small screens */
-            gap: 16px;
-            margin-top: 16px;
+            gap: 8px; /* Tighter button gap */
+            margin-top: 12px; /* Reduced margin */
             justify-content: center;
+            flex-shrink: 0; /* Don't shrink buttons */
         }
         .btn {
-            font-size: 1.1rem;
+            font-size: 1rem; /* Smaller button text */
             font-weight: 600;
-            padding: 12px 24px;
+            padding: 10px 20px; /* Smaller buttons */
             border-radius: 8px;
             border: none;
             cursor: pointer;
@@ -93,12 +117,19 @@
             background-color: #5a6268;
         }
         #feedback-message {
-            margin-top: 16px;
-            font-size: 1.1rem;
+            margin-top: 12px; /* Reduced margin */
+            font-size: 1rem; /* Smaller text */
             font-weight: 600;
-            height: 24px;
+            
+            /* --- MODIFICATION FOR WRAPPING --- */
+            min-height: 20px; /* Changed from height */
+            height: auto;     /* Allow it to grow if text wraps */
+            width: 90%;       /* Prevent it from being too wide */
+            /* --- END MODIFICATION --- */
+
             text-align: center;
             transition: opacity 0.3s ease;
+            flex-shrink: 0; /* Don't shrink this text */
         }
         .feedback-success {
             color: #42b72a;
@@ -329,6 +360,19 @@
 
         // --- 6. Initialize ---
         (async () => {
+            
+            // --- NEW: Mobile Viewport Fix ---
+            // This sets the height to the actual inner window height,
+            // avoiding issues with the mobile address bar.
+            const setViewportHeight = () => {
+                // We execute this on load and on resize.
+                let vh = window.innerHeight * 0.01;
+                document.documentElement.style.setProperty('--vh', `${vh}px`);
+            };
+            setViewportHeight();
+            window.addEventListener('resize', setViewportHeight);
+            // --- End of Viewport Fix ---
+
             // Check for HTTPS
             if (window.location.protocol !== "https:") {
                 // This check is still valid, as the app is loaded
