@@ -13,7 +13,7 @@ This project consists of a Python Flask server that handles face detection (usin
 Clone or download this repository to your computer.
 Use the package manager [pip](https://pip.pypa.io/en/stable/) to install the required dependencies.
 ```bash
-pip install Flask opencv-python numpy Pillow pyOpenSSL
+pip install flask fpdf numpy Pillow deepface tensorflow tf-keras cheroot opencv-python-headless odoorpc
 ```
 
 ## Download Haar Cascade File
